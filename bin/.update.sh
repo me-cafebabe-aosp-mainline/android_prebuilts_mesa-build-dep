@@ -12,26 +12,22 @@ fi
 
 cd $(dirname $(realpath $0))
 
-BINS="afuc-asm
-afuc-disasm
-asahi_clc
+BINS="asahi_clc
 aubinator
 aubinator_error_decode
 aubinator_viewer
-brw_asm
-brw_disasm
 bsdcat
 bsdcpio
 bsdtar
 computerator
-crashdec
 elk_asm
 elk_disasm
-generate_rd
+gentool
 intel_dev_info
 intel_dump_gpu
 intel_error2aub
 intel_error2hangdump
+intel_eu_stall_viewer
 intel_hang_replay
 intel_hang_viewer
 intel_measure.py
@@ -41,11 +37,11 @@ intel_stub_gpu
 mda
 mesa_clc
 panfrost_compile
-panfrostdump
 panfrost_texfeatures
+panfrostdump
 pco_clc
-rddecompiler
-replay
+qrisc-asm
+qrisc-disasm
 spirv2nir
 vtn_bindgen2"
 
