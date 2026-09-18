@@ -70,7 +70,7 @@ done
 
 INTEL_STUB_GPU_PLATFORM=$platform
 
-drm_shim_dir="/usr/local/lib/x86_64-linux-gnu"
+drm_shim_dir="$(realpath "$(dirname "$0")")/../lib64"
 
 if [ -n "$MESON_DEVENV" ]; then
     drm_shim_dir=$(realpath "$(dirname "$0")")
