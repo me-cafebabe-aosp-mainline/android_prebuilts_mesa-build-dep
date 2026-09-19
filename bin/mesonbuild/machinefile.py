@@ -9,35 +9,21 @@ import os
 
 from . import mparser
 
+from .cmdline import CmdLineFileParser
 from .mesonlib import MesonException
 
 if T.TYPE_CHECKING:
-    from typing_extensions import TypeAlias
-
-    from .coredata import StrOrBytesPath
-
-    SectionT: TypeAlias = T.Union[str, int, bool, T.List[str], T.List['SectionT']]
+    from .options import ElementaryOptionValues
 
 
-class CmdLineFileParser(configparser.ConfigParser):
-    def __init__(self) -> None:
-        # We don't want ':' as key delimiter, otherwise it would break when
-        # storing subproject options like "subproject:option=value"
-        super().__init__(delimiters=['='], interpolation=None)
-
-    def read(self, filenames: T.Union['StrOrBytesPath', T.Iterable['StrOrBytesPath']], encoding: T.Optional[str] = 'utf-8') -> T.List[str]:
-        return super().read(filenames, encoding)
-
-    def optionxform(self, optionstr: str) -> str:
-        # Don't call str.lower() on keys
-        return optionstr
+HOMEDIR = os.path.expanduser('~')
 
 
 class MachineFileParser():
     def __init__(self, filenames: T.List[str], sourcedir: str) -> None:
         self.parser = CmdLineFileParser()
-        self.constants: T.Dict[str, SectionT] = {'True': True, 'False': False}
-        self.sections: T.Dict[str, T.Dict[str, SectionT]] = {}
+        self.constants: T.Dict[str, ElementaryOptionValues] = {'True': True, 'False': False, '~': HOMEDIR}
+        self.sections: T.Dict[str, T.Dict[str, ElementaryOptionValues]] = {}
 
         for fname in filenames:
             try:
@@ -62,16 +48,16 @@ class MachineFileParser():
                 continue
             self.sections[s] = self._parse_section(s)
 
-    def _parse_section(self, s: str) -> T.Dict[str, SectionT]:
+    def _parse_section(self, s: str) -> T.Dict[str, ElementaryOptionValues]:
         self.scope = self.constants.copy()
-        section: T.Dict[str, SectionT] = {}
+        section: T.Dict[str, ElementaryOptionValues] = {}
         for entry, value in self.parser.items(s):
             if ' ' in entry or '\t' in entry or "'" in entry or '"' in entry:
                 raise MesonException(f'Malformed variable name {entry!r} in machine file.')
             # Windows paths...
             value = value.replace('\\', '\\\\')
             try:
-                ast = mparser.Parser(value, 'machinefile').parse()
+                ast = mparser.Parser(value, 'machinefile', machinefile=True).parse()
                 if not ast.lines:
                     raise MesonException('value cannot be empty')
                 res = self._evaluate_statement(ast.lines[0])
@@ -83,7 +69,7 @@ class MachineFileParser():
             self.scope[entry] = res
         return section
 
-    def _evaluate_statement(self, node: mparser.BaseNode) -> SectionT:
+    def _evaluate_statement(self, node: mparser.BaseNode) -> ElementaryOptionValues:
         if isinstance(node, (mparser.StringNode)):
             return node.value
         elif isinstance(node, mparser.BooleanNode):
@@ -93,23 +79,25 @@ class MachineFileParser():
         elif isinstance(node, mparser.ParenthesizedNode):
             return self._evaluate_statement(node.inner)
         elif isinstance(node, mparser.ArrayNode):
-            return [self._evaluate_statement(arg) for arg in node.args.arguments]
+            a = [self._evaluate_statement(arg) for arg in node.args.arguments]
+            assert all(isinstance(s, str) for s in a), 'for mypy'
+            return T.cast('T.List[str]', a)
         elif isinstance(node, mparser.IdNode):
             return self.scope[node.value]
         elif isinstance(node, mparser.ArithmeticNode):
             l = self._evaluate_statement(node.left)
             r = self._evaluate_statement(node.right)
-            if node.operation == 'add':
+            if node.operation == '+':
                 if isinstance(l, str) and isinstance(r, str):
                     return l + r
                 if isinstance(l, list) and isinstance(r, list):
                     return l + r
-            elif node.operation == 'div':
+            elif node.operation == '/':
                 if isinstance(l, str) and isinstance(r, str):
                     return os.path.join(l, r)
         raise MesonException('Unsupported node type')
 
-def parse_machine_files(filenames: T.List[str], sourcedir: str) -> T.Dict[str, T.Dict[str, SectionT]]:
+def parse_machine_files(filenames: T.List[str], sourcedir: str) -> T.Dict[str, T.Dict[str, ElementaryOptionValues]]:
     parser = MachineFileParser(filenames, sourcedir)
     return parser.sections
 

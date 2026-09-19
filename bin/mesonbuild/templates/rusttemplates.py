@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2019 The Meson development team
+# Copyright © 2023-2025 Intel Corporation
 
 from __future__ import annotations
 
 import typing as T
 
 from mesonbuild.templates.sampleimpl import FileImpl
+
+if T.TYPE_CHECKING:
+    from ..minit import Arguments
 
 
 lib_rust_template = '''#![crate_name = "{crate_file}"]
@@ -33,20 +37,38 @@ mod tests {{
 '''
 
 
-lib_rust_meson_template = '''project('{project_name}', 'rust',
-  version : '{version}', meson_version: '>=1.3.0',
-  default_options : ['rust_std=2021', 'warning_level=3'])
+lib_rust_meson_template = '''project(
+  '{project_name}',
+  'rust',
+  version : '{version}',
+  meson_version : '>= {meson_version}',
+  default_options : ['rust_std=2021', 'warning_level=3'],
+)
 
 rust = import('rust')
 
-shlib = static_library('{lib_name}', '{source_file}', install : true)
+dependencies = [{dependencies}
+]
 
-rust.test('{test_name}', shlib)
+sources = [{source_files}
+]
+
+lib = static_library(
+  '{lib_name}',
+  sources,
+  dependencies : dependencies,
+  install : true,
+)
+
+rust.test('{test_name}', lib)
 
 # Make this library usable as a Meson subproject.
 {ltoken}_dep = declare_dependency(
-  include_directories: include_directories('.'),
-  link_with : shlib)
+  include_directories : include_directories('.'),
+  dependencies : dependencies,
+  link_with : lib,
+)
+meson.override_dependency('{project_name}', {ltoken}_dep)
 '''
 
 hello_rust_template = '''
@@ -56,12 +78,26 @@ fn main() {{
 }}
 '''
 
-hello_rust_meson_template = '''project('{project_name}', 'rust',
-  version : '{version}', meson_version: '>=1.3.0',
-  default_options : ['rust_std=2021', 'warning_level=3'])
+hello_rust_meson_template = '''project(
+  '{project_name}',
+  'rust',
+  version : '{version}',
+  meson_version : '>= {meson_version}',
+  default_options : ['rust_std=2021', 'warning_level=3'],
+)
 
-exe = executable('{exe_name}', '{source_name}',
-  install : true)
+dependencies = [{dependencies}
+]
+
+sources = [{source_files}
+]
+
+exe = executable(
+  '{exe_name}',
+  sources,
+  dependencies : dependencies,
+  install : true,
+)
 
 test('basic', exe)
 '''
@@ -75,6 +111,10 @@ class RustProject(FileImpl):
     lib_template = lib_rust_template
     lib_test_template = None
     lib_meson_template = lib_rust_meson_template
+
+    def __init__(self, args: Arguments):
+        super().__init__(args)
+        self.meson_version = '1.3.0'
 
     def lib_kwargs(self) -> T.Dict[str, str]:
         kwargs = super().lib_kwargs()

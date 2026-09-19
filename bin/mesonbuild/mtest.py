@@ -23,14 +23,13 @@ import signal
 import subprocess
 import shlex
 import sys
-import textwrap
 import time
 import typing as T
 import unicodedata
 import xml.etree.ElementTree as et
 
 from . import build
-from . import environment
+from . import tooldetect
 from . import mlog
 from .coredata import MesonVersionMismatchException, major_versions_differ
 from .coredata import version as coredata_version
@@ -91,6 +90,9 @@ def is_windows() -> bool:
 def is_cygwin() -> bool:
     return sys.platform == 'cygwin'
 
+def is_os2() -> bool:
+    return platform.system().lower() == 'os/2'
+
 UNIWIDTH_MAPPING = {'F': 2, 'H': 1, 'W': 2, 'Na': 1, 'N': 1, 'A': 1}
 def uniwidth(s: str) -> int:
     result = 0
@@ -99,10 +101,33 @@ def uniwidth(s: str) -> int:
         result += UNIWIDTH_MAPPING[w]
     return result
 
+def test_slice(arg: str) -> T.Tuple[int, int]:
+    values = arg.split('/')
+    if len(values) != 2:
+        raise argparse.ArgumentTypeError("value does not conform to format 'SLICE/NUM_SLICES'")
+
+    try:
+        nrslices = int(values[1])
+    except ValueError:
+        raise argparse.ArgumentTypeError('NUM_SLICES is not an integer')
+    if nrslices <= 0:
+        raise argparse.ArgumentTypeError('NUM_SLICES is not a positive integer')
+
+    try:
+        subslice = int(values[0])
+    except ValueError:
+        raise argparse.ArgumentTypeError('SLICE is not an integer')
+    if subslice <= 0:
+        raise argparse.ArgumentTypeError('SLICE is not a positive integer')
+    if subslice > nrslices:
+        raise argparse.ArgumentTypeError('SLICE exceeds NUM_SLICES')
+
+    return subslice, nrslices
+
 # Note: when adding arguments, please also add them to the completion
 # scripts in $MESONSRC/data/shell-completions/
 def add_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument('--maxfail', default=0, type=int,
+    parser.add_argument('-k', '--maxfail', default=0, type=int,
                         help='Number of failing tests before aborting the '
                         'test run. (default: 0, to disable aborting on failure)')
     parser.add_argument('--repeat', default=1, dest='repeat', type=int,
@@ -125,6 +150,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
                         help='Only run tests belonging to the given suite.')
     parser.add_argument('--no-suite', default=[], dest='exclude_suites', action='append', metavar='SUITE',
                         help='Do not run tests belonging to the given suite.')
+    parser.add_argument('--exclude', default=[], dest='exclude', action='append',
+                        help='Exclude tests with the given name.')
     parser.add_argument('--no-stdsplit', default=True, dest='split', action='store_false',
                         help='Do not split stderr and stdout in test logs.')
     parser.add_argument('--print-errorlogs', default=False, action='store_true',
@@ -149,11 +176,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
                         help='Arguments to pass to the specified test(s) or all tests')
     parser.add_argument('--max-lines', default=100, dest='max_lines', type=int,
                         help='Maximum number of lines to show from a long test log. Since 1.5.0.')
+    parser.add_argument('--slice', default=None, type=test_slice, metavar='SLICE/NUM_SLICES',
+                        help='Split tests into NUM_SLICES slices and execute slice SLICE. Since 1.8.0.')
     parser.add_argument('args', nargs='*',
                         help='Optional list of test names to run. "testname" to run all tests with that name, '
                         '"subprojname:testname" to specifically run "testname" from "subprojname", '
                         '"subprojname:" to run all tests defined by "subprojname".')
-
 
 def print_safe(s: str) -> None:
     end = '' if s[-1] == '\n' else '\n'
@@ -198,11 +226,14 @@ def returncode_to_status(retcode: int) -> str:
         return f'exit status {retcode}'
 
     signum = retcode - 128
-    try:
-        signame = signal.Signals(signum).name
-    except ValueError:
-        signame = 'SIGinvalid'
-    return f'(exit status {retcode} or signal {signum} {signame})'
+    if signum < 32:
+        try:
+            signame = signal.Signals(signum).name
+        except ValueError:
+            signame = 'SIGinvalid'
+        return f'(exit status {retcode} or signal {signum} {signame})'
+
+    return f'(exit status {retcode} or {hex(retcode)})'
 
 # TODO for Windows
 sh_quote: T.Callable[[str], str] = lambda x: x
@@ -243,6 +274,7 @@ class TestResult(enum.Enum):
     EXPECTEDFAIL = 'EXPECTEDFAIL'
     UNEXPECTEDPASS = 'UNEXPECTEDPASS'
     ERROR = 'ERROR'
+    IGNORED = 'IGNORED'
 
     @staticmethod
     def maxlen() -> int:
@@ -264,7 +296,7 @@ class TestResult(enum.Enum):
     def colorize(self, s: str) -> mlog.AnsiDecorator:
         if self.is_bad():
             decorator = mlog.red
-        elif self in (TestResult.SKIP, TestResult.EXPECTEDFAIL):
+        elif self in (TestResult.SKIP, TestResult.IGNORED, TestResult.EXPECTEDFAIL):
             decorator = mlog.yellow
         elif self.is_finished():
             decorator = mlog.green
@@ -366,7 +398,6 @@ class TAPParser:
     def parse_line(self, line: T.Optional[str]) -> T.Iterator[TYPE_TAPResult]:
         if line is not None:
             self.lineno += 1
-            line = line.rstrip()
 
             # YAML blocks are only accepted after a test
             if self.state == self._AFTER_TEST:
@@ -387,6 +418,8 @@ class TAPParser:
                     return
                 yield self.Error(f'YAML block not terminated (started on line {self.yaml_lineno})')
                 self.state = self._MAIN
+
+            line = line.rstrip()
 
             assert self.state == self._MAIN
             if not line or line.startswith('#'):
@@ -478,7 +511,8 @@ class TestLogger:
     def start_test(self, harness: 'TestHarness', test: 'TestRun') -> None:
         pass
 
-    def log_subtest(self, harness: 'TestHarness', test: 'TestRun', s: str, res: TestResult) -> None:
+    def log_subtest(self, harness: 'TestHarness', test: 'TestRun', s: str, res: TestResult,
+                    explanation: T.Optional[str]) -> None:
         pass
 
     def log(self, harness: 'TestHarness', result: 'TestRun') -> None:
@@ -525,12 +559,13 @@ class ConsoleLogger(TestLogger):
         self.test_count = 0
         self.started_tests = 0
         self.spinner_index = 0
-        try:
-            self.cols, _ = os.get_terminal_size(1)
-            self.is_tty = True
-        except OSError:
-            self.cols = 80
-            self.is_tty = False
+        self.is_tty = sys.stdout.isatty()
+        self.cols = 80
+        if self.is_tty:
+            try:
+                self.cols, _ = os.get_terminal_size(1)
+            except (OSError, AttributeError):
+                self.is_tty = False
 
         self.output_start = dashes(self.SCISSORS, self.HLINE, self.cols - 2)
         self.output_end = dashes('', self.HLINE, self.cols - 2)
@@ -551,7 +586,10 @@ class ConsoleLogger(TestLogger):
 
     def print_progress(self, line: str) -> None:
         print(self.should_erase_line, line, sep='', end='\r')
-        self.should_erase_line = '\x1b[K'
+        if self.is_tty:
+            self.should_erase_line = '\x1b[K'
+        else:
+            self.should_erase_line = '\n'
 
     def request_update(self) -> None:
         self.update.set()
@@ -673,13 +711,16 @@ class ConsoleLogger(TestLogger):
             print_safe(log)
             print(self.output_end)
 
-    def log_subtest(self, harness: 'TestHarness', test: 'TestRun', s: str, result: TestResult) -> None:
+    def log_subtest(self, harness: 'TestHarness', test: 'TestRun', s: str, result: TestResult, explanation: T.Optional[str]) -> None:
         if test.verbose or (harness.options.print_errorlogs and result.is_bad()):
             self.flush()
             print(harness.format(test, mlog.colorize_console(), max_left_width=self.max_left_width,
                                  prefix=self.sub,
                                  middle=s,
                                  right=result.get_text(mlog.colorize_console())), flush=True)
+
+            if explanation is not None:
+                print(result.colorize(f"{' ' * len(self.sub)}Reason: {explanation}").get_text(mlog.colorize_console()))
 
             self.request_update()
 
@@ -698,7 +739,7 @@ class ConsoleLogger(TestLogger):
             else:
                 print(harness.format(result, mlog.colorize_console(), max_left_width=self.max_left_width),
                       flush=True)
-                if result.verbose or result.res.is_bad():
+                if result.verbose or harness.is_bad_result(result):
                     self.print_log(harness, result)
             if result.warnings:
                 print(flush=True)
@@ -766,6 +807,7 @@ class JsonLogfileBuilder(TestFileLogger):
             'name': result.name,
             'stdout': result.stdo,
             'result': result.res.value,
+            'is_fail': result.res.is_bad(),
             'starttime': result.starttime,
             'duration': result.duration,
             'returncode': result.returncode,
@@ -834,7 +876,8 @@ class JunitBuilder(TestLogger):
                                {TestResult.INTERRUPT, TestResult.ERROR})),
                 failures=str(sum(1 for r in test.results if r.result in
                                  {TestResult.FAIL, TestResult.UNEXPECTEDPASS, TestResult.TIMEOUT})),
-                skipped=str(sum(1 for r in test.results if r.result is TestResult.SKIP)),
+                skipped=str(sum(1 for r in test.results if r.result in
+                                {TestResult.SKIP, TestResult.IGNORED})),
                 time=str(test.duration),
             )
 
@@ -844,6 +887,9 @@ class JunitBuilder(TestLogger):
                 testcase = et.SubElement(suite, 'testcase', name=str(subtest), classname=suitename)
                 if subtest.result is TestResult.SKIP:
                     et.SubElement(testcase, 'skipped')
+                elif subtest.result is TestResult.IGNORED:
+                    skip = et.SubElement(testcase, 'skipped')
+                    skip.text = 'Test output was not parsed.'
                 elif subtest.result is TestResult.ERROR:
                     et.SubElement(testcase, 'error')
                 elif subtest.result is TestResult.FAIL:
@@ -878,6 +924,10 @@ class JunitBuilder(TestLogger):
                                      classname=test.project, time=str(test.duration))
             if test.res is TestResult.SKIP:
                 et.SubElement(testcase, 'skipped')
+                suite.attrib['skipped'] = str(int(suite.attrib['skipped']) + 1)
+            elif test.res is TestResult.IGNORED:
+                skip = et.SubElement(testcase, 'skipped')
+                skip.text = 'Test output was not parsed.'
                 suite.attrib['skipped'] = str(int(suite.attrib['skipped']) + 1)
             elif test.res is TestResult.ERROR:
                 et.SubElement(testcase, 'error')
@@ -925,7 +975,8 @@ class TestRun:
         return super().__new__(TestRun.PROTOCOL_TO_CLASS[test.protocol])
 
     def __init__(self, test: TestSerialisation, test_env: T.Dict[str, str],
-                 name: str, timeout: T.Optional[int], is_parallel: bool, verbose: bool):
+                 name: str, timeout: T.Optional[int], is_parallel: bool, verbose: bool,
+                 interactive: bool):
         self.res = TestResult.PENDING
         self.test = test
         self._num: T.Optional[int] = None
@@ -940,11 +991,13 @@ class TestRun:
         self.additional_error = ''
         self.cmd: T.Optional[T.List[str]] = None
         self.env = test_env
-        self.should_fail = test.should_fail
+        self.expected_fail = test.expected_fail
+        self.expected_exitcode = test.expected_exitcode
         self.project = test.project_name
         self.junit: T.Optional[et.ElementTree] = None
         self.is_parallel = is_parallel
         self.verbose = verbose
+        self.interactive = interactive
         self.warnings: T.List[str] = []
 
     def start(self, cmd: T.List[str]) -> None:
@@ -960,6 +1013,15 @@ class TestRun:
         return self._num
 
     @property
+    def console_mode(self) -> ConsoleUser:
+        if self.interactive:
+            return ConsoleUser.INTERACTIVE
+        elif self.direct_stdout:
+            return ConsoleUser.STDOUT
+        else:
+            return ConsoleUser.LOGGER
+
+    @property
     def direct_stdout(self) -> bool:
         return self.verbose and not self.is_parallel and not self.needs_parsing
 
@@ -967,7 +1029,7 @@ class TestRun:
         if self.results:
             # running or succeeded
             passed = sum(x.result.is_ok() for x in self.results)
-            ran = sum(x.result is not TestResult.SKIP for x in self.results)
+            ran = sum(x.result not in {TestResult.SKIP, TestResult.IGNORED} for x in self.results)
             if passed == ran:
                 return f'{passed} subtests passed'
             else:
@@ -987,8 +1049,10 @@ class TestRun:
     def _complete(self) -> None:
         if self.res == TestResult.RUNNING:
             self.res = TestResult.OK
+        if self.needs_parsing and self.console_mode is ConsoleUser.INTERACTIVE:
+            self.res = TestResult.IGNORED
         assert isinstance(self.res, TestResult)
-        if self.should_fail and self.res in (TestResult.OK, TestResult.FAIL):
+        if self.expected_fail and self.res in (TestResult.OK, TestResult.FAIL):
             self.res = TestResult.UNEXPECTEDPASS if self.res is TestResult.OK else TestResult.EXPECTEDFAIL
         if self.stdo and not self.stdo.endswith('\n'):
             self.stdo += '\n'
@@ -1044,12 +1108,14 @@ class TestRunExitCode(TestRun):
     def complete(self) -> None:
         if self.res != TestResult.RUNNING:
             pass
+        elif self.returncode == (self.expected_exitcode or 0):
+            self.res = TestResult.OK
         elif self.returncode == GNU_SKIP_RETURNCODE:
             self.res = TestResult.SKIP
         elif self.returncode == GNU_ERROR_RETURNCODE:
             self.res = TestResult.ERROR
         else:
-            self.res = TestResult.FAIL if bool(self.returncode) else TestResult.OK
+            self.res = TestResult.FAIL
         super().complete()
 
 TestRun.PROTOCOL_TO_CLASS[TestProtocol.EXITCODE] = TestRunExitCode
@@ -1084,7 +1150,7 @@ class TestRunTAP(TestRun):
         return True
 
     def complete(self) -> None:
-        if self.returncode != 0 and not self.res.was_killed():
+        if self.returncode != 0 and not self.res.is_bad():
             self.res = TestResult.ERROR
             self.stde = self.stde or ''
             self.stde += f'\n(test program exited with status code {self.returncode})'
@@ -1100,12 +1166,12 @@ class TestRunTAP(TestRun):
                 version = i.version
             elif isinstance(i, TAPParser.Bailout):
                 res = TestResult.ERROR
-                harness.log_subtest(self, i.message, res)
+                harness.log_subtest(self, i.message, res, None)
             elif isinstance(i, TAPParser.Test):
                 self.results.append(i)
                 if i.result.is_bad():
                     res = TestResult.FAIL
-                harness.log_subtest(self, i.name or f'subtest {i.number}', i.result)
+                harness.log_subtest(self, i.name or f'subtest {i.number}', i.result, i.explanation)
             elif isinstance(i, TAPParser.UnknownLine):
                 warnings.append(i)
             elif isinstance(i, TAPParser.Error):
@@ -1143,7 +1209,7 @@ class TestRunRust(TestRun):
         def parse_res(n: int, name: str, result: str) -> TAPParser.Test:
             if result == 'ok':
                 return TAPParser.Test(n, name, TestResult.OK, None)
-            elif result == 'ignored':
+            elif result.startswith('ignored'):
                 return TAPParser.Test(n, name, TestResult.SKIP, None)
             elif result == 'FAILED':
                 return TAPParser.Test(n, name, TestResult.FAIL, None)
@@ -1163,7 +1229,7 @@ class TestRunRust(TestRun):
                 name = name.replace('::', '.')
                 t = parse_res(n, name, result)
                 self.results.append(t)
-                harness.log_subtest(self, name, t.result)
+                harness.log_subtest(self, name, t.result, None)
                 n += 1
 
         res = None
@@ -1225,7 +1291,7 @@ async def read_decode(reader: asyncio.StreamReader,
             await queue.put(None)
 
 def run_with_mono(fname: str) -> bool:
-    return fname.endswith('.exe') and not (is_windows() or is_cygwin())
+    return fname.endswith('.exe') and not (is_windows() or is_cygwin() or is_os2())
 
 def check_testdata(objs: T.List[TestSerialisation]) -> T.List[TestSerialisation]:
     if not isinstance(objs, list):
@@ -1440,6 +1506,15 @@ class SingleTestRunner:
         if ('MSAN_OPTIONS' not in env or not env['MSAN_OPTIONS']):
             env['MSAN_OPTIONS'] = 'halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1'
 
+        # Valgrind also doesn't reflect errors in its exit code by default.
+        if 'VALGRIND_OPTS' not in env or not env['VALGRIND_OPTS']:
+            try:
+                wrapper_name = TestHarness.get_wrapper(self.options)[0]
+                if 'valgrind' in wrapper_name:
+                    env['VALGRIND_OPTS'] = '--error-exitcode=1'
+            except IndexError:
+                pass
+
         if self.options.interactive or self.test.timeout is None or self.test.timeout <= 0:
             timeout = None
         elif self.options.timeout_multiplier is None:
@@ -1451,14 +1526,11 @@ class SingleTestRunner:
 
         is_parallel = test.is_parallel and self.options.num_processes > 1 and not self.options.interactive
         verbose = (test.verbose or self.options.verbose) and not self.options.quiet
-        self.runobj = TestRun(test, env, name, timeout, is_parallel, verbose)
+        self.runobj = TestRun(test, env, name, timeout, is_parallel, verbose, self.options.interactive)
 
-        if self.options.interactive:
-            self.console_mode = ConsoleUser.INTERACTIVE
-        elif self.runobj.direct_stdout:
-            self.console_mode = ConsoleUser.STDOUT
-        else:
-            self.console_mode = ConsoleUser.LOGGER
+    @property
+    def console_mode(self) -> ConsoleUser:
+        return self.runobj.console_mode
 
     def _get_test_cmd(self) -> T.Optional[T.List[str]]:
         testentry = self.test.fname[0]
@@ -1549,7 +1621,7 @@ class SingleTestRunner:
                                                  stderr=stderr,
                                                  env=env,
                                                  cwd=cwd,
-                                                 preexec_fn=preexec_fn if not is_windows() else None)
+                                                 preexec_fn=preexec_fn if not (is_windows() or is_os2()) else None)
         return TestSubprocess(p, stdout=stdout, stderr=stderr,
                               postwait_fn=postwait_fn if not is_windows() else None)
 
@@ -1579,7 +1651,7 @@ class SingleTestRunner:
                                        env=self.runobj.env,
                                        cwd=self.test.workdir)
 
-        if self.runobj.needs_parsing:
+        if self.runobj.needs_parsing and self.console_mode is not ConsoleUser.INTERACTIVE:
             parse_coro = self.runobj.parse(harness, p.stdout_lines())
             parse_task = asyncio.ensure_future(parse_coro)
         else:
@@ -1602,11 +1674,13 @@ class TestHarness:
     def __init__(self, options: argparse.Namespace):
         self.options = options
         self.collected_failures: T.List[TestRun] = []
+        self.maxfail_reached = False
         self.fail_count = 0
         self.expectedfail_count = 0
         self.unexpectedpass_count = 0
         self.success_count = 0
         self.skip_count = 0
+        self.ignored_count = 0
         self.timeout_count = 0
         self.test_count = 0
         self.name_max_len = 0
@@ -1647,7 +1721,7 @@ class TestHarness:
         if self.options.no_rebuild:
             return
 
-        self.ninja = environment.detect_ninja()
+        self.ninja = tooldetect.detect_ninja()
         if not self.ninja:
             print("Can't find ninja, can't rebuild test.")
             # If ninja can't be found return exit code 127, indicating command
@@ -1750,6 +1824,8 @@ class TestHarness:
             self.timeout_count += 1
         elif result.res is TestResult.SKIP:
             self.skip_count += 1
+        elif result.res is TestResult.IGNORED:
+            self.ignored_count += 1
         elif result.res is TestResult.OK:
             self.success_count += 1
         elif result.res in {TestResult.FAIL, TestResult.ERROR, TestResult.INTERRUPT}:
@@ -1761,10 +1837,13 @@ class TestHarness:
         else:
             sys.exit(f'Unknown test result encountered: {result.res}')
 
-        if result.res.is_bad():
+        if self.is_bad_result(result):
             self.collected_failures.append(result)
         for l in self.loggers:
             l.log(self, result)
+
+    def is_bad_result(self, result: TestRun) -> bool:
+        return result.res.is_bad() and not (result.res is TestResult.INTERRUPT and self.maxfail_reached)
 
     @property
     def numlen(self) -> int:
@@ -1808,15 +1887,22 @@ class TestHarness:
         return prefix + left + middle + right
 
     def summary(self) -> str:
-        return textwrap.dedent('''
-            Ok:                 {:<4}
-            Expected Fail:      {:<4}
-            Fail:               {:<4}
-            Unexpected Pass:    {:<4}
-            Skipped:            {:<4}
-            Timeout:            {:<4}
-            ''').format(self.success_count, self.expectedfail_count, self.fail_count,
-                        self.unexpectedpass_count, self.skip_count, self.timeout_count)
+        results = {
+          'Ok:                ': self.success_count,
+          'Expected Fail:     ': self.expectedfail_count,
+          'Fail:              ': self.fail_count,
+          'Unexpected Pass:   ': self.unexpectedpass_count,
+          'Skipped:           ': self.skip_count,
+          'Ignored:           ': self.ignored_count,
+          'Timeout:           ': self.timeout_count,
+        }
+
+        summary = []
+        for result, count in results.items():
+            if count > 0 or result.startswith('Ok:') or result.startswith('Fail:'):
+                summary.append(result + '{:<4}'.format(count))
+
+        return '\n{}\n'.format('\n'.join(summary))
 
     def total_failure_count(self) -> int:
         return self.fail_count + self.unexpectedpass_count + self.timeout_count
@@ -1826,7 +1912,12 @@ class TestHarness:
             raise RuntimeError('Test harness object can only be used once.')
         self.is_run = True
         tests = self.get_tests()
-        rebuild_only_tests = tests if self.options.args else []
+        # NOTE: If all tests are selected anyway, we pass
+        # an empty list to `rebuild_deps`, which then will execute
+        # the "meson-test-prereq" ninja target as a fallback.
+        # This prevents situations, where ARG_MAX may overflow
+        # if there are many targets.
+        rebuild_only_tests = tests if tests != self.tests else []
         if not tests:
             return 0
         if not self.options.no_rebuild and not rebuild_deps(self.ninja, self.options.wd, rebuild_only_tests, self.options.benchmark):
@@ -1857,7 +1948,7 @@ class TestHarness:
             self.run_tests(runners)
         finally:
             os.chdir(startdir)
-        return self.total_failure_count()
+        return 1 if self.total_failure_count() > 0 else 0
 
     @staticmethod
     def split_suite_string(suite: str) -> T.Tuple[str, str]:
@@ -1875,33 +1966,34 @@ class TestHarness:
             for prjst in test.suite:
                 (prj, st) = TestHarness.split_suite_string(prjst)
 
-                # the SUITE can be passed as
-                #     suite_name
-                # or
-                #     project_name:suite_name
-                # so we need to select only the test belonging to project_name
-
-                # this if handle the first case (i.e., SUITE == suite_name)
-
-                # in this way we can run tests belonging to different
-                # (sub)projects which share the same suite_name
-                if not st_match and st == prj_match:
-                    return True
-
-                # these two conditions are needed to handle the second option
-                # i.e., SUITE == project_name:suite_name
-
-                # in this way we select the only the tests of
-                # project_name with suite_name
-                if prj_match and prj != prj_match:
-                    continue
-                if st_match and st != st_match:
-                    continue
-                return True
+                # The SUITE can be passed as
+                # - `name` - We select tests belonging to (sub)project OR suite
+                #   with the given name.
+                # - `:suite_name` - We select tests belonging to any (sub)projects
+                #   and in suite_name.
+                # - `project_name:suite_name` - We select tests belonging
+                #   to project_name and in suite_name.
+                if not st_match:
+                    if prj_match in {prj, st}:
+                        return True
+                elif not prj_match:
+                    if st == st_match:
+                        return True
+                else:
+                    if prj == prj_match and st == st_match:
+                        return True
         return False
 
-    def test_suitable(self, test: TestSerialisation) -> bool:
+    def test_suitable(self, test: TestSerialisation, excluded_tests: set[str]) -> bool:
         if TestHarness.test_in_suites(test, self.options.exclude_suites):
+            return False
+
+        # Accept both --exclude name and --exclude subproject:name.
+        # For the main project, we also accept 'name' without qualification
+        # for convenience.
+        if self.build_data.project_name == test.project_name and test.name in excluded_tests:
+            return False
+        if f'{test.project_name}:{test.name}' in excluded_tests:
             return False
 
         if self.options.include_suites:
@@ -1974,9 +2066,16 @@ class TestHarness:
             print('No tests defined.', file=errorfile)
             return []
 
-        tests = [t for t in self.tests if self.test_suitable(t)]
+        excluded_tests = set(self.options.exclude)
+        tests = [t for t in self.tests if self.test_suitable(t, excluded_tests)]
+
         if self.options.args:
             tests = list(self.tests_from_args(tests))
+        if self.options.slice:
+            our_slice, nslices = self.options.slice
+            if nslices > len(tests):
+                raise MesonException(f'number of slices ({nslices}) exceeds number of tests ({len(tests)})')
+            tests = tests[our_slice - 1::nslices]
 
         if not tests:
             print('No suitable tests defined.', file=errorfile)
@@ -1998,42 +2097,47 @@ class TestHarness:
 
     @staticmethod
     def get_wrapper(options: argparse.Namespace) -> T.List[str]:
-        wrap: T.List[str] = []
         if options.gdb:
             wrap = [options.gdb_path, '--quiet']
             if options.repeat > 1:
                 wrap += ['-ex', 'run', '-ex', 'quit']
             # Signal the end of arguments to gdb
             wrap += ['--args']
-        if options.wrapper:
-            wrap += options.wrapper
+        elif options.wrapper:
+            wrap = options.wrapper
+        else:
+            wrap = []
         return wrap
 
     def get_pretty_suite(self, test: TestSerialisation) -> str:
-        if len(self.suites) > 1 and test.suite:
-            rv = TestHarness.split_suite_string(test.suite[0])[0]
-            s = "+".join(TestHarness.split_suite_string(s)[1] for s in test.suite)
+        assert test.suite, 'Interpreter should ensure there is always at least one suite'
+        prj = TestHarness.split_suite_string(test.suite[0])[0]
+        suites: T.List[str] = []
+        for i in test.suite:
+            s = TestHarness.split_suite_string(i)[1]
             if s:
-                rv += ":"
-            return rv + s + " / " + test.name
-        else:
-            return test.name
+                suites.append(s)
+        name = f'{prj}:{test.name}'
+        if suites:
+            s = '+'.join(suites)
+            name = f'{s} - {name}'
+        return name
 
     def run_tests(self, runners: T.List[SingleTestRunner]) -> None:
         try:
             self.open_logfiles()
 
             # TODO: this is the default for python 3.8
-            if sys.platform == 'win32':
+            if sys.platform == 'win32' and sys.version_info < (3, 8):
                 asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
             asyncio.run(self._run_tests(runners))
         finally:
             self.close_logfiles()
 
-    def log_subtest(self, test: TestRun, s: str, res: TestResult) -> None:
+    def log_subtest(self, test: TestRun, s: str, res: TestResult, explanation: T.Optional[str]) -> None:
         for l in self.loggers:
-            l.log_subtest(self, test, s, res)
+            l.log_subtest(self, test, s, res, explanation)
 
     def log_start_test(self, test: TestRun) -> None:
         for l in self.loggers:
@@ -2055,6 +2159,7 @@ class TestHarness:
                 self.process_test_result(res)
                 maxfail = self.options.maxfail
                 if maxfail and self.fail_count >= maxfail and res.res.is_bad():
+                    self.maxfail_reached = True
                     cancel_all_tests()
 
         def test_done(f: asyncio.Future) -> None:
@@ -2216,11 +2321,11 @@ def run(options: argparse.Namespace) -> int:
             return 1
 
     b = build.load(options.wd)
-    need_vsenv = T.cast('bool', b.environment.coredata.get_option(OptionKey('vsenv')))
+    need_vsenv = T.cast('bool', b.environment.coredata.optstore.get_value_for(OptionKey('vsenv')))
     setup_vsenv(need_vsenv)
 
     if not options.no_rebuild:
-        backend = b.environment.coredata.get_option(OptionKey('backend'))
+        backend = b.environment.coredata.optstore.get_value_for(OptionKey('backend'))
         if backend == 'none':
             # nothing to build...
             options.no_rebuild = True

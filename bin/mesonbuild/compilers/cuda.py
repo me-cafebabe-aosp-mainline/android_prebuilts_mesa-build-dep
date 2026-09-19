@@ -1,30 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2012-2017 The Meson development team
+# Copyright © 2023-2025 Intel Corporation
 
 from __future__ import annotations
 
 import enum
-import os.path
 import string
 import typing as T
 
-from .. import coredata
 from .. import options
-from .. import mlog
-from ..mesonlib import (
-    EnvironmentException, Popen_safe,
-    is_windows, LibType, version_compare
-)
-from ..options import OptionKey
-from .compilers import Compiler
+from ..mesonlib import is_windows, LibType, version_compare
+from .compilers import Compiler, CompileCheckMode, CrossNoRunException, SimplePrefixLinkerOptionStyle
 
 if T.TYPE_CHECKING:
-    from .compilers import CompileCheckMode
     from ..build import BuildTarget
-    from ..coredata import MutableKeyedOptionDictType, KeyedOptionDictType
+    from ..options import MutableKeyedOptionDictType
     from ..dependencies import Dependency
     from ..environment import Environment  # noqa: F401
-    from ..envconfig import MachineInfo
     from ..linkers.linkers import DynamicLinker
     from ..mesonlib import MachineChoice
 
@@ -53,7 +45,7 @@ class Phase(enum.Enum):
 
 class CudaCompiler(Compiler):
 
-    LINKER_PREFIX = '-Xlinker='
+    LINKER_OPTION_STYLE = SimplePrefixLinkerOptionStyle('-Xlinker=')
     language = 'cuda'
 
     # NVCC flags taking no arguments.
@@ -185,11 +177,11 @@ class CudaCompiler(Compiler):
     id = 'nvcc'
 
     def __init__(self, ccache: T.List[str], exelist: T.List[str], version: str, for_machine: MachineChoice,
-                 is_cross: bool,
-                 host_compiler: Compiler, info: 'MachineInfo',
+                 host_compiler: Compiler, env: Environment,
                  linker: T.Optional['DynamicLinker'] = None,
                  full_version: T.Optional[str] = None):
-        super().__init__(ccache, exelist, version, for_machine, info, linker=linker, full_version=full_version, is_cross=is_cross)
+        self.detected_cc = ''
+        super().__init__(ccache, exelist, version, for_machine, env, linker=linker, full_version=full_version)
         self.host_compiler = host_compiler
         self.base_options = host_compiler.base_options
         # -Wpedantic generates useless churn due to nvcc's dual compilation model producing
@@ -200,6 +192,7 @@ class CudaCompiler(Compiler):
             for level, flags in host_compiler.warn_args.items()
         }
         self.host_werror_args = ['-Xcompiler=' + x for x in self.host_compiler.get_werror_args()]
+        self.debug_macros_available = version_compare(self.version, '>=12.9')
 
     @classmethod
     def _shield_nvcc_list_arg(cls, arg: str, listmode: bool = True) -> str:
@@ -497,115 +490,68 @@ class CudaCompiler(Compiler):
     def needs_static_linker(self) -> bool:
         return False
 
-    def thread_link_flags(self, environment: 'Environment') -> T.List[str]:
-        return self._to_host_flags(self.host_compiler.thread_link_flags(environment), Phase.LINKER)
+    def thread_link_flags(self) -> T.List[str]:
+        return self._to_host_flags(self.host_compiler.thread_link_flags(), Phase.LINKER)
 
-    def sanity_check(self, work_dir: str, env: 'Environment') -> None:
-        mlog.debug('Sanity testing ' + self.get_display_language() + ' compiler:', ' '.join(self.exelist))
-        mlog.debug('Is cross compiler: %s.' % str(self.is_cross))
+    def init_from_options(self) -> None:
+        super().init_from_options()
+        try:
+            res = self.run(self._sanity_check_source_code())
+            if res.returncode == 0:
+                self.detected_cc = res.stdout.strip()
+        except CrossNoRunException:
+            pass
 
-        sname = 'sanitycheckcuda.cu'
-        code = r'''
-        #include <cuda_runtime.h>
-        #include <stdio.h>
+    def _sanity_check_source_code(self) -> str:
+        return r'''
+            #include <cuda_runtime.h>
+            #include <stdio.h>
 
-        __global__ void kernel (void) {}
+            __global__ void kernel (void) {}
 
-        int main(void){
-            struct cudaDeviceProp prop;
-            int count, i;
-            cudaError_t ret = cudaGetDeviceCount(&count);
-            if(ret != cudaSuccess){
-                fprintf(stderr, "%d\n", (int)ret);
-            }else{
-                for(i=0;i<count;i++){
-                    if(cudaGetDeviceProperties(&prop, i) == cudaSuccess){
-                        fprintf(stdout, "%d.%d\n", prop.major, prop.minor);
+            int main(void){
+                struct cudaDeviceProp prop;
+                int count, i;
+                cudaError_t ret = cudaGetDeviceCount(&count);
+                if(ret != cudaSuccess){
+                    fprintf(stderr, "%d\n", (int)ret);
+                }else{
+                    for(i=0;i<count;i++){
+                        if(cudaGetDeviceProperties(&prop, i) == cudaSuccess){
+                            fprintf(stdout, "%d.%d\n", prop.major, prop.minor);
+                        }
                     }
                 }
+                fflush(stderr);
+                fflush(stdout);
+                return 0;
             }
-            fflush(stderr);
-            fflush(stdout);
-            return 0;
-        }
-        '''
-        binname = sname.rsplit('.', 1)[0]
-        binname += '_cross' if self.is_cross else ''
-        source_name = os.path.join(work_dir, sname)
-        binary_name = os.path.join(work_dir, binname + '.exe')
-        with open(source_name, 'w', encoding='utf-8') as ofile:
-            ofile.write(code)
+            '''
 
-        # The Sanity Test for CUDA language will serve as both a sanity test
-        # and a native-build GPU architecture detection test, useful later.
-        #
-        # For this second purpose, NVCC has very handy flags, --run and
-        # --run-args, that allow one to run an application with the
-        # environment set up properly. Of course, this only works for native
-        # builds; For cross builds we must still use the exe_wrapper (if any).
-        self.detected_cc = ''
-        flags = []
-
+    def _sanity_check_compile_args(self, sourcename: str, binname: str
+                                   ) -> T.Tuple[T.List[str], T.List[str]]:
         # Disable warnings, compile with statically-linked runtime for minimum
         # reliance on the system.
-        flags += ['-w', '-cudart', 'static', source_name]
+        flags = ['-w', '-cudart', 'static', sourcename]
 
         # Use the -ccbin option, if available, even during sanity checking.
         # Otherwise, on systems where CUDA does not support the default compiler,
         # NVCC becomes unusable.
-        flags += self.get_ccbin_args(env.coredata.optstore)
+        flags += self._get_ccbin_args(None, '')
 
         # If cross-compiling, we can't run the sanity check, only compile it.
-        if self.is_cross and not env.has_exe_wrapper():
+        if self.is_cross and not self.environment.has_exe_wrapper():
             # Linking cross built apps is painful. You can't really
             # tell if you should use -nostdlib or not and for example
             # on OSX the compiler binary is the same but you need
             # a ton of compiler flags to differentiate between
             # arm and x86_64. So just compile.
             flags += self.get_compile_only_args()
-        flags += self.get_output_args(binary_name)
+        flags += self.get_output_args(binname)
 
-        # Compile sanity check
-        cmdlist = self.exelist + flags
-        mlog.debug('Sanity check compiler command line: ', ' '.join(cmdlist))
-        pc, stdo, stde = Popen_safe(cmdlist, cwd=work_dir)
-        mlog.debug('Sanity check compile stdout: ')
-        mlog.debug(stdo)
-        mlog.debug('-----\nSanity check compile stderr:')
-        mlog.debug(stde)
-        mlog.debug('-----')
-        if pc.returncode != 0:
-            raise EnvironmentException(f'Compiler {self.name_string()} cannot compile programs.')
+        return self.exelist + flags, []
 
-        # Run sanity check (if possible)
-        if self.is_cross:
-            if not env.has_exe_wrapper():
-                return
-            else:
-                cmdlist = env.exe_wrapper.get_command() + [binary_name]
-        else:
-            cmdlist = self.exelist + ['--run', '"' + binary_name + '"']
-        mlog.debug('Sanity check run command line: ', ' '.join(cmdlist))
-        pe, stdo, stde = Popen_safe(cmdlist, cwd=work_dir)
-        mlog.debug('Sanity check run stdout: ')
-        mlog.debug(stdo)
-        mlog.debug('-----\nSanity check run stderr:')
-        mlog.debug(stde)
-        mlog.debug('-----')
-        pe.wait()
-        if pe.returncode != 0:
-            raise EnvironmentException(f'Executables created by {self.language} compiler {self.name_string()} are not runnable.')
-
-        # Interpret the result of the sanity test.
-        # As mentioned above, it is not only a sanity test but also a GPU
-        # architecture detection test.
-        if stde == '':
-            self.detected_cc = stdo
-        else:
-            mlog.debug('cudaGetDeviceCount() returned ' + stde)
-
-    def has_header_symbol(self, hname: str, symbol: str, prefix: str,
-                          env: 'Environment', *,
+    def has_header_symbol(self, hname: str, symbol: str, prefix: str, *,
                           extra_args: T.Union[None, T.List[str], T.Callable[[CompileCheckMode], T.List[str]]] = None,
                           dependencies: T.Optional[T.List['Dependency']] = None) -> T.Tuple[bool, bool]:
         if extra_args is None:
@@ -621,7 +567,7 @@ class CudaCompiler(Compiler):
             #endif
             return 0;
         }}'''
-        found, cached = self.compiles(t.format_map(fargs), env, extra_args=extra_args, dependencies=dependencies)
+        found, cached = self.compiles(t.format_map(fargs), extra_args=extra_args, dependencies=dependencies)
         if found:
             return True, cached
         # Check if it's a class or a template
@@ -631,7 +577,7 @@ class CudaCompiler(Compiler):
         int main(void) {{
             return 0;
         }}'''
-        return self.compiles(t.format_map(fargs), env, extra_args=extra_args, dependencies=dependencies)
+        return self.compiles(t.format_map(fargs), extra_args=extra_args, dependencies=dependencies)
 
     _CPP14_VERSION = '>=9.0'
     _CPP17_VERSION = '>=11.0'
@@ -646,54 +592,56 @@ class CudaCompiler(Compiler):
         if version_compare(self.version, self._CPP20_VERSION):
             cpp_stds += ['c++20']
 
-        return self.update_options(
-            super().get_options(),
-            self.create_option(options.UserComboOption,
-                               self.form_compileropt_key('std'),
-                               'C++ language standard to use with CUDA',
-                               cpp_stds,
-                               'none'),
-            self.create_option(options.UserStringOption,
-                               self.form_compileropt_key('ccbindir'),
-                               'CUDA non-default toolchain directory to use (-ccbin)',
-                               ''),
-        )
+        opts = super().get_options()
 
-    def _to_host_compiler_options(self, master_options: 'KeyedOptionDictType') -> 'KeyedOptionDictType':
-        """
-        Convert an NVCC Option set to a host compiler's option set.
-        """
+        key = self.form_compileropt_key('std')
+        opts[key] = options.UserComboOption(
+            self.make_option_name(key),
+            'C++ language standard to use with CUDA',
+            'none',
+            choices=cpp_stds)
 
-        # We must strip the -std option from the host compiler option set, as NVCC has
-        # its own -std flag that may not agree with the host compiler's.
-        host_options = {key: master_options.get(key, opt) for key, opt in self.host_compiler.get_options().items()}
-        std_key = OptionKey(f'{self.host_compiler.language}_std', machine=self.for_machine)
-        overrides = {std_key: 'none'}
-        # To shut up mypy.
-        return coredata.OptionsView(host_options, overrides=overrides)
+        key = self.form_compileropt_key('ccbindir')
+        opts[key] = options.UserStringOption(
+            self.make_option_name(key),
+            'CUDA non-default toolchain directory to use (-ccbin)',
+            '')
 
-    def get_option_compile_args(self, options: 'KeyedOptionDictType') -> T.List[str]:
-        args = self.get_ccbin_args(options)
+        return opts
+
+    def get_option_compile_args(self, target: 'BuildTarget', subproject: T.Optional[str] = None) -> T.List[str]:
+        args = self._get_ccbin_args(target, subproject)
+
+        try:
+            host_compiler_args = self.host_compiler.get_option_compile_args(target, subproject)
+        except KeyError:
+            host_compiler_args = []
+        return args + self._to_host_flags(host_compiler_args)
+
+    def get_option_std_args(self, target: BuildTarget, subproject: T.Optional[str] = None) -> T.List[str]:
         # On Windows, the version of the C++ standard used by nvcc is dictated by
         # the combination of CUDA version and MSVC version; the --std= is thus ignored
         # and attempting to use it will result in a warning: https://stackoverflow.com/a/51272091/741027
         if not is_windows():
-            key = self.form_compileropt_key('std')
-            std = options.get_value(key)
+            std = self.get_compileropt_value('std', target, subproject)
+            assert isinstance(std, str)
             if std != 'none':
-                args.append('--std=' + std)
+                return ['--std=' + std]
 
-        return args + self._to_host_flags(self.host_compiler.get_option_compile_args(self._to_host_compiler_options(options)))
+        try:
+            host_compiler_args = self.host_compiler.get_option_std_args(target, subproject)
+        except KeyError:
+            host_compiler_args = []
+        return self._to_host_flags(host_compiler_args)
 
-    def get_option_link_args(self, options: 'KeyedOptionDictType') -> T.List[str]:
-        args = self.get_ccbin_args(options)
-        return args + self._to_host_flags(self.host_compiler.get_option_link_args(self._to_host_compiler_options(options)), Phase.LINKER)
+    def get_option_link_args(self, target: 'BuildTarget', subproject: T.Optional[str] = None) -> T.List[str]:
+        args = self._get_ccbin_args(target, subproject)
+        return args + self._to_host_flags(self.host_compiler.get_option_link_args(target, subproject), Phase.LINKER)
 
-    def get_soname_args(self, env: 'Environment', prefix: str, shlib_name: str,
-                        suffix: str, soversion: str,
+    def get_soname_args(self, prefix: str, shlib_name: str, suffix: str, soversion: str,
                         darwin_versions: T.Tuple[str, str]) -> T.List[str]:
         return self._to_host_flags(self.host_compiler.get_soname_args(
-            env, prefix, shlib_name, suffix, soversion, darwin_versions), Phase.LINKER)
+            prefix, shlib_name, suffix, soversion, darwin_versions), Phase.LINKER)
 
     def get_compile_only_args(self) -> T.List[str]:
         return ['-c']
@@ -707,11 +655,11 @@ class CudaCompiler(Compiler):
         # return self._to_host_flags(self.host_compiler.get_optimization_args(optimization_level))
         return cuda_optimization_args[optimization_level]
 
-    def sanitizer_compile_args(self, value: str) -> T.List[str]:
-        return self._to_host_flags(self.host_compiler.sanitizer_compile_args(value))
+    def sanitizer_compile_args(self, target: T.Optional[BuildTarget], value: T.List[str]) -> T.List[str]:
+        return self._to_host_flags(self.host_compiler.sanitizer_compile_args(target, value))
 
-    def sanitizer_link_args(self, value: str) -> T.List[str]:
-        return self._to_host_flags(self.host_compiler.sanitizer_link_args(value))
+    def sanitizer_link_args(self, target: T.Optional[BuildTarget], value: T.List[str]) -> T.List[str]:
+        return self._to_host_flags(self.host_compiler.sanitizer_link_args(target, value))
 
     def get_debug_args(self, is_debug: bool) -> T.List[str]:
         return cuda_debug_args[is_debug]
@@ -740,11 +688,14 @@ class CudaCompiler(Compiler):
     def get_optimization_link_args(self, optimization_level: str) -> T.List[str]:
         return self._to_host_flags(self.host_compiler.get_optimization_link_args(optimization_level), Phase.LINKER)
 
-    def build_rpath_args(self, env: 'Environment', build_dir: str, from_dir: str,
-                         rpath_paths: T.Tuple[str, ...], build_rpath: str,
-                         install_rpath: str) -> T.Tuple[T.List[str], T.Set[bytes]]:
+    def get_linker_fatal_warnings(self) -> T.List[str]:
+        return self._to_host_flags(self.host_compiler.get_linker_fatal_warnings(), Phase.LINKER)
+
+    def build_rpath_args(self, build_dir: str, from_dir: str, target: BuildTarget,
+                         extra_paths: T.Optional[T.List[str]] = None
+                         ) -> T.Tuple[T.List[str], T.Set[bytes]]:
         (rpath_args, rpath_dirs_to_remove) = self.host_compiler.build_rpath_args(
-            env, build_dir, from_dir, rpath_paths, build_rpath, install_rpath)
+            build_dir, from_dir, target, extra_paths)
         return (self._to_host_flags(rpath_args, Phase.LINKER), rpath_dirs_to_remove)
 
     def linker_to_compiler_args(self, args: T.List[str]) -> T.List[str]:
@@ -772,21 +723,22 @@ class CudaCompiler(Compiler):
     def get_std_exe_link_args(self) -> T.List[str]:
         return self._to_host_flags(self.host_compiler.get_std_exe_link_args(), Phase.LINKER)
 
-    def find_library(self, libname: str, env: 'Environment', extra_dirs: T.List[str],
-                     libtype: LibType = LibType.PREFER_SHARED, lib_prefix_warning: bool = True) -> T.Optional[T.List[str]]:
-        return self.host_compiler.find_library(libname, env, extra_dirs, libtype, lib_prefix_warning)
+    def find_library(self, libname: str, extra_dirs: T.List[str], libtype: LibType = LibType.PREFER_SHARED,
+                     lib_prefix_warning: bool = True, ignore_system_dirs: bool = False,
+                     skip_link_check: bool = False) -> T.Optional[T.List[str]]:
+        return self.host_compiler.find_library(libname, extra_dirs, libtype, lib_prefix_warning, ignore_system_dirs, skip_link_check)
 
-    def get_crt_compile_args(self, crt_val: str, buildtype: str) -> T.List[str]:
-        return self._to_host_flags(self.host_compiler.get_crt_compile_args(crt_val, buildtype))
+    def get_crt_compile_args(self, crt_val: str) -> T.List[str]:
+        return self._to_host_flags(self.host_compiler.get_crt_compile_args(crt_val))
 
-    def get_crt_link_args(self, crt_val: str, buildtype: str) -> T.List[str]:
+    def get_crt_link_args(self, crt_val: str) -> T.List[str]:
         # nvcc defaults to static, release version of msvc runtime and provides no
         # native option to override it; override it with /NODEFAULTLIB
         host_link_arg_overrides = []
-        host_crt_compile_args = self.host_compiler.get_crt_compile_args(crt_val, buildtype)
+        host_crt_compile_args = self.host_compiler.get_crt_compile_args(crt_val)
         if any(arg in {'/MDd', '/MD', '/MTd'} for arg in host_crt_compile_args):
             host_link_arg_overrides += ['/NODEFAULTLIB:LIBCMT.lib']
-        return self._to_host_flags(host_link_arg_overrides + self.host_compiler.get_crt_link_args(crt_val, buildtype), Phase.LINKER)
+        return self._to_host_flags(host_link_arg_overrides + self.host_compiler.get_crt_link_args(crt_val), Phase.LINKER)
 
     def get_target_link_args(self, target: 'BuildTarget') -> T.List[str]:
         return self._to_host_flags(super().get_target_link_args(target), Phase.LINKER)
@@ -797,9 +749,13 @@ class CudaCompiler(Compiler):
     def get_dependency_link_args(self, dep: 'Dependency') -> T.List[str]:
         return self._to_host_flags(super().get_dependency_link_args(dep), Phase.LINKER)
 
-    def get_ccbin_args(self, ccoptions: 'KeyedOptionDictType') -> T.List[str]:
-        key = self.form_compileropt_key('ccbindir')
-        ccbindir = ccoptions.get_value(key)
+    def _get_ccbin_args(self, target: 'T.Optional[BuildTarget]',
+                        subproject: T.Optional[str] = None) -> T.List[str]:
+        key = self.form_compileropt_key('ccbindir').evolve(subproject=subproject)
+        if target:
+            ccbindir = self.environment.coredata.get_option_for_target(target, key)
+        else:
+            ccbindir = self.environment.coredata.optstore.get_value_for(key)
         if isinstance(ccbindir, str) and ccbindir != '':
             return [self._shield_nvcc_list_arg('-ccbin='+ccbindir, False)]
         else:
@@ -811,5 +767,20 @@ class CudaCompiler(Compiler):
     def get_profile_use_args(self) -> T.List[str]:
         return ['-Xcompiler=' + x for x in self.host_compiler.get_profile_use_args()]
 
-    def get_assert_args(self, disable: bool, env: 'Environment') -> T.List[str]:
-        return self.host_compiler.get_assert_args(disable, env)
+    def get_assert_args(self, disable: bool) -> T.List[str]:
+        cccl_macros = []
+        if not disable and self.debug_macros_available:
+            # https://github.com/NVIDIA/cccl/pull/2382
+            cccl_macros = ['-DCCCL_ENABLE_ASSERTIONS=1']
+
+        return self.host_compiler.get_assert_args(disable) + cccl_macros
+
+    def has_multi_arguments(self, args: T.List[str]) -> T.Tuple[bool, bool]:
+        args = self._to_host_flags(args)
+        return self.compiles('int main(void) { return 0; }', extra_args=args, mode=CompileCheckMode.COMPILE)
+
+    def has_multi_link_arguments(self, args: T.List[str], to_host_args: bool = True) -> T.Tuple[bool, bool]:
+        if to_host_args:
+            args = self._to_host_flags(args, phase=Phase.LINKER)
+        args = ['-Xnvlink='+self._shield_nvcc_list_arg(s) for s in self.linker.fatal_warnings()] + args
+        return self.compiles('int main(void) { return 0; }', extra_args=args, mode=CompileCheckMode.LINK)
